@@ -1,0 +1,30 @@
+{
+  "summary": {
+    "num_ref_notes": 7,
+    "num_played_notes": 7,
+    "num_correct": 5,
+    "num_wrong": 1,
+    "num_missed": 1,
+    "num_extra": 1,
+    "dtw_total_cost": 4.0
+  },
+  "errors": [
+    {
+      "type": "wrong",
+      "expected": "D4",
+      "played": "E4",
+      "ref_onset": 0.5,
+      "played_onset": 0.52
+    },
+    {
+      "type": "missed",
+      "expected": "E4",
+      "ref_onset": 1.0
+    },
+    {
+      "type": "extra",
+      "played": "C5",
+      "played_onset": 3.4
+    }
+  ]
+}

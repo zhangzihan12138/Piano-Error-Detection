@@ -1,0 +1,12 @@
+# 钢琴错误检测系统 —— 依赖清单
+# 安装：pip install -r requirements.txt
+# 说明：torch 为 CPU 版本；如需 GPU，请按 https://pytorch.org 指引单独安装对应 CUDA 版本。
+
+torch==2.14.1
+numpy==2.5.4
+matplotlib==3.11.2
+librosa==1.0.0
+pretty_midi==0.2.11.post0
+scipy==1.18.1
+scikit-learn==1.9.1
+gradio==6.30.0
