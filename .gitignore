@@ -22,6 +22,10 @@ piano.sf2
 # ===== 模型权重（可选，如需保留可注释掉下一行） =====
 # piano_model.pth
 
+# ===== Gradio 运行产物 =====
+.gradio/
+flagged/
+
 # ===== IDE / 编辑器 =====
 .vscode/
 .idea/
@@ -39,3 +43,10 @@ desktop.ini
 logs/
 *.pth
 *.pt
+
+# ===== 临时开发脚本 / 打包产物（下划线开头的中间文件） =====
+_*.py
+_*.ps1
+_*.vbs
+_*.bundle
+_smoke_out/

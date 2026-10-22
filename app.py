@@ -1,7 +1,7 @@
 """钢琴错误检测系统 - Gradio 演示网页。
 
 完整流程：
-    上传演奏 WAV + 参考 MIDI
+    上传演奏音频（WAV / MP3）或视频（MP4，自动抽取音轨）+ 参考 MIDI
         → 提取 log-mel 频谱（与 make_dataset.py 相同参数）
         → PianoErrorModel 预测每帧 88 键激活概率
         → post_process 转换为音符事件序列
@@ -15,6 +15,8 @@
 """
 
 import os
+import subprocess
+import tempfile
 
 import gradio as gr
 import librosa
@@ -44,6 +46,13 @@ PITCH_MIN = 36   # 音域下限 MIDI（C2）
 PITCH_MAX = 96   # 音域上限 MIDI（C7）
 ANALYSIS_SEC = TARGET_LEN / FPS  # 模型单次可分析时长 ≈ 11.9 秒
 
+# ---------------- 支持的输入格式 ----------------
+# 音频容器：librosa（soundfile 后端）可直接读取
+AUDIO_EXTS = (".wav", ".mp3", ".flac", ".ogg", ".m4a")
+# 视频容器：需先用 ffmpeg 抽取音轨再分析
+VIDEO_EXTS = (".mp4", ".mov", ".mkv", ".avi", ".webm")
+SUPPORTED_EXTS = AUDIO_EXTS + VIDEO_EXTS
+
 # ---------------- 路径 ----------------
 _HERE = os.path.dirname(os.path.abspath(__file__))
 MODEL_PATH = os.path.join(_HERE, "piano_model.pth")
@@ -72,9 +81,64 @@ def _pad_or_truncate(arr: np.ndarray, target_len: int) -> np.ndarray:
     return np.pad(arr, pad_width, mode="constant", constant_values=0)
 
 
-def extract_mel(wav_path: str) -> tuple[np.ndarray, float]:
-    """WAV -> (log-mel 频谱 [512, 128], 音频时长秒)。"""
-    y, _ = librosa.load(wav_path, sr=SR)
+def _find_ffmpeg() -> str | None:
+    """定位 ffmpeg 可执行文件：优先 imageio-ffmpeg 自带二进制，其次系统 PATH。"""
+    try:
+        import imageio_ffmpeg
+
+        return imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception:
+        from shutil import which
+
+        return which("ffmpeg")
+
+
+def ensure_wav(path: str) -> tuple[str, bool]:
+    """把上传文件统一成可供 librosa 读取的 WAV 路径。
+
+    - 音频格式（WAV/MP3/FLAC/OGG/M4A）：直接返回原路径，is_temp=False
+    - 视频格式（MP4/MOV/MKV...）：调用 ffmpeg 抽取音轨到临时 WAV，
+      返回 (临时路径, True)，调用方负责删除临时文件
+    """
+    ext = os.path.splitext(path)[1].lower()
+    if ext not in VIDEO_EXTS:
+        return path, False
+
+    ffmpeg = _find_ffmpeg()
+    if not ffmpeg:
+        raise gr.Error("未找到 ffmpeg，无法从视频中抽取音轨。请先执行：pip install imageio-ffmpeg")
+
+    tmp = tempfile.NamedTemporaryFile(suffix="_extracted.wav", delete=False, dir=tempfile.gettempdir())
+    tmp_path = tmp.name
+    tmp.close()
+
+    # -vn 丢弃视频流，-ac 1 单声道，-ar 统一采样率，保证与训练参数一致
+    cmd = [ffmpeg, "-y", "-i", path, "-vn", "-ac", "1", "-ar", str(SR), "-f", "wav", tmp_path]
+    proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="ignore")
+
+    if proc.returncode != 0 or not os.path.exists(tmp_path) or os.path.getsize(tmp_path) == 0:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        detail = (proc.stderr or "").strip()[-300:]
+        raise gr.Error(f"音轨提取失败（文件可能无音轨或已损坏）：{detail}")
+
+    return tmp_path, True
+
+
+def extract_mel(audio_path: str) -> tuple[np.ndarray, float]:
+    """音频/视频文件 -> (log-mel 频谱 [512, 128], 音频时长秒)。"""
+    wav_path, is_temp = ensure_wav(audio_path)
+    try:
+        y, _ = librosa.load(wav_path, sr=SR)
+    finally:
+        # 只清理自己生成的临时 WAV，不碰用户上传的原文件
+        if is_temp:
+            try:
+                os.remove(wav_path)
+            except OSError:
+                pass
     duration = len(y) / SR
     mel = librosa.feature.melspectrogram(y=y, sr=SR, n_mels=N_MELS, hop_length=HOP).T  # [T, 128]
     mel = librosa.power_to_db(mel)
@@ -186,15 +250,15 @@ def _pitch_by_name(name: str) -> int:
     return name_to_midi(name)
 
 
-def analyze(wav_path, midi_path):
-    """主处理流程：频谱 -> 预测 -> 音符 -> DTW 找错 -> JSON + 时间轴图。"""
-    if not wav_path:
-        raise gr.Error("请先上传演奏录音 WAV 文件")
+def analyze(audio_path, midi_path):
+    """主处理流程：抽取音轨（视频）→ 频谱 → 预测 → 音符 → DTW 找错 → JSON + 时间轴图。"""
+    if not audio_path:
+        raise gr.Error("请先上传演奏录音或视频（WAV / MP3 / MP4）")
     if not midi_path:
         raise gr.Error("请先上传参考乐谱 MIDI 文件")
 
-    # 1. 提取频谱 + 2. 模型预测 + 3. 转音符序列
-    mel, audio_dur = extract_mel(wav_path)
+    # 1. 提取频谱（MP4 等视频格式会先抽音轨） + 2. 模型预测 + 3. 转音符序列
+    mel, audio_dur = extract_mel(audio_path)
     perf_notes = predict_notes(mel)
 
     # 4. 参考 MIDI 音符序列（按音频时长归一化 tempo，兼容异常 MIDI）
@@ -225,12 +289,18 @@ with gr.Blocks(title="钢琴错误检测系统") as demo:
     gr.Markdown(
         """
         # 钢琴错误检测系统
-        上传**演奏录音（WAV）**和**参考乐谱（MIDI）**，系统将提取频谱、用 CNN+Bi-LSTM 模型
-        逐帧检测琴键激活，转换为音符序列后与参考做 DTW 对齐，找出**错音 / 漏音 / 多弹**。
+        上传**演奏音频（WAV / MP3）**或**演奏视频（MP4）**，以及**参考乐谱（MIDI）**。
+        视频会自动抽取音轨；系统提取频谱、用 CNN+Bi-LSTM 模型逐帧检测琴键激活，
+        转换为音符序列后与参考做 DTW 对齐，找出**错音 / 漏音 / 多弹**。
         """
     )
     with gr.Row():
-        wav_in = gr.Audio(type="filepath", label="演奏录音 WAV")
+        audio_in = gr.File(
+            label="演奏录音 / 视频（WAV / MP3 / MP4）",
+            file_types=[".wav", ".mp3", ".mp4"],
+            file_count="single",
+            type="filepath",
+        )
         midi_in = gr.File(label="参考乐谱 MIDI", file_types=[".mid", ".midi"])
     btn = gr.Button("开始分析", variant="primary")
 
@@ -243,7 +313,7 @@ with gr.Blocks(title="钢琴错误检测系统") as demo:
         img_dtw = gr.Image(DTW_PNG, label="DTW 对齐路径（自测）", interactive=False)
         img_cm = gr.Image(CM_PNG, label="测试集混淆矩阵", interactive=False)
 
-    btn.click(analyze, inputs=[wav_in, midi_in], outputs=[out_json, out_timeline])
+    btn.click(analyze, inputs=[audio_in, midi_in], outputs=[out_json, out_timeline])
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False)
+    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False, share=True)

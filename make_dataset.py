@@ -1,12 +1,15 @@
-"""训练数据集生成脚本：基于 original.mid + 钢琴 SoundFont 渲染 + 错误注入。
+"""训练数据集生成脚本：基于多曲目 MIDI 语料 + 钢琴 SoundFont 渲染 + 错误注入。
 
-核心改动（相比正弦合成版本）：
-  1. 用 FluidSynth + 钢琴 SoundFont 渲染 MIDI 音频（替换正弦叠加），
+核心改动（相比单曲目版本）：
+  1. 从 midi_songs/ 目录随机选取曲目（9 首单音旋律/音阶/琶音），
+     使模型见过更宽的音高分布和更多旋律走向，缓解"换曲子就失效"的泛化问题。
+  2. 每段样本随机整体移调 ±5 个半音（自动限制在 MIDI 21~108 内），
+     进一步扩大音高覆盖范围。
+  3. 用 FluidSynth + 钢琴 SoundFont 渲染 MIDI 音频（替换正弦叠加），
      使训练音色更接近真实钢琴，缓解"音色域不匹配"问题。
-  2. 对 original.mid 的异常 tempo 做归一化：42 个音符从 512s 压缩到 ~14s，
-     使 512 帧窗口（~11.9s）能覆盖多个不同音符，模型才能学到多音高检测。
-  3. 保留变速（0.9~1.1x）、错误注入（错音/漏音/多弹）逻辑。
-  4. 轻量数据增强：随机力度、微小时序抖动、低强度背景噪声。
+  4. 对所有曲目统一做 tempo 归一化到 ~14s，保证 512 帧窗口能覆盖多个音符。
+  5. 保留变速（0.9~1.1x）、错误注入（错音/漏音/多弹）逻辑。
+  6. 轻量数据增强：随机力度、微小时序抖动。
 
 输出：
   data/features/mel_*.npy   : [T, 128] log-mel 频谱
@@ -14,8 +17,11 @@
   mel_spectrogram.png       : 首个样本的频谱可视化
 """
 
+import argparse
+import glob
 import os
 import random
+from collections import Counter
 
 import librosa
 import matplotlib
@@ -28,20 +34,45 @@ import matplotlib.pyplot as plt
 # ---------------- 常量 ----------------
 SR, HOP, N_MELS = 22050, 512, 128
 N_SAMPLES = 1000
-SOUNDFONT_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "piano.sf2")
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+SOUNDFONT_PATH = os.path.join(BASE_DIR, "piano.sf2")
+MIDI_DIR = os.path.join(BASE_DIR, "midi_songs")  # 多曲目语料目录
+FALLBACK_MIDI = os.path.join(BASE_DIR, "original.mid")
 TARGET_DURATION = 14.0  # 归一化后整段 MIDI 的目标时长（秒），使 512 帧窗口覆盖多音符
+TRANSPOSE_RANGE = 5     # 每段样本随机整体移调的最大半音数
 
-os.makedirs("data/features", exist_ok=True)
+# 统一使用绝对路径，避免从其他工作目录启动时产物写错位置
+DATA_DIR = os.path.join(BASE_DIR, "data", "features")
+os.makedirs(DATA_DIR, exist_ok=True)
 
 # 全局复用一个 FluidSynth 实例，避免每个样本重复加载 SoundFont（~140MB）
 _synth = None
 _sfid = None
 
 
+def _ensure_fluidsynth_on_path() -> None:
+    """Windows 下把含 libfluidsynth-3.dll 的目录加入 PATH。
+
+    pyfluidsynth 通过 ctypes.util.find_library 查找 DLL，只认 PATH；
+    本项目的 DLL 随 venv 放在 .venv/Scripts 下，因此这里自动补齐，
+    避免每次手动设置环境变量。
+    """
+    if os.name != "nt":
+        return
+    for d in (os.path.join(BASE_DIR, ".venv", "Scripts"), os.path.join(BASE_DIR, "fluidsynth", "bin")):
+        if os.path.isdir(d) and d.lower() not in os.environ.get("PATH", "").lower():
+            os.environ["PATH"] = d + os.pathsep + os.environ.get("PATH", "")
+            try:
+                os.add_dll_directory(d)  # 同时注册依赖 DLL 的搜索目录
+            except (AttributeError, OSError):
+                pass
+
+
 def get_synth():
     """获取（懒加载）全局 FluidSynth 合成器实例。"""
     global _synth, _sfid
     if _synth is None:
+        _ensure_fluidsynth_on_path()
         import fluidsynth
         _synth = fluidsynth.Synth(samplerate=SR, gain=0.5)
         _sfid = _synth.sfload(SOUNDFONT_PATH)
@@ -50,9 +81,40 @@ def get_synth():
     return _synth
 
 
-def normalize_tempo(mid: pretty_midi.PrettyMIDI, target_duration: float = TARGET_DURATION) -> None:
-    """将 original.mid 的异常 tempo（每音 12.8s，共 512s）归一化到 target_duration。
+def list_midi_files() -> list[str]:
+    """列出 midi_songs/ 下的所有 MIDI 曲目；目录为空时回退到 original.mid。"""
+    files = sorted(
+        glob.glob(os.path.join(MIDI_DIR, "*.mid"))
+        + glob.glob(os.path.join(MIDI_DIR, "*.midi"))
+    )
+    return files if files else [FALLBACK_MIDI]
 
+
+def transpose_midi(mid: pretty_midi.PrettyMIDI, max_shift: int = TRANSPOSE_RANGE) -> int:
+    """随机整体移调，返回实际移调的半音数（0 表示不移调）。
+
+    移调范围自动收窄，保证所有音高仍落在 MIDI 21~108（对应 88 键标签）内。
+    """
+    pitches = [n.pitch for inst in mid.instruments for n in inst.notes]
+    if not pitches:
+        return 0
+    low = max(-max_shift, 21 - min(pitches))
+    high = min(max_shift, 108 - max(pitches))
+    if low > high:
+        return 0
+    shift = random.randint(low, high)
+    if shift:
+        for inst in mid.instruments:
+            for n in inst.notes:
+                n.pitch += shift
+    return shift
+
+
+def normalize_tempo(mid: pretty_midi.PrettyMIDI, target_duration: float = TARGET_DURATION) -> None:
+    """将所有曲目统一缩放到 target_duration。
+
+    原始 original.mid 的 tempo 异常（每音 12.8s，共 512s），归一化后可让
+    512 帧窗口覆盖多个音符；其他曲目同样归一化，保证各曲目时长一致。
     直接原地缩放所有音符的 start/end。
     """
     old_dur = mid.get_end_time()
@@ -165,59 +227,81 @@ def midi_to_label(mid: pretty_midi.PrettyMIDI, n_frames: int) -> np.ndarray:
     return lab
 
 
-def main() -> None:
-    random.seed(42)
-    np.random.seed(42)
+def main(start: int = 0, count: int = N_SAMPLES) -> None:
+    """生成数据集。
 
+    Args:
+        start: 起始样本编号（用于分块生成，避免单次运行超时）。
+        count: 本次生成的样本数量，默认 N_SAMPLES=1000。
+    每个样本使用独立随机种子（42 + i），因此分块生成与一次性生成的样本完全一致。
+    """
     print(f"SoundFont: {SOUNDFONT_PATH}")
-    print(f"目标时长: {TARGET_DURATION}s | 样本数: {N_SAMPLES}")
+    midi_files = list_midi_files()
+    print(f"曲目语料: {len(midi_files)} 首 -> {[os.path.basename(p) for p in midi_files]}")
+    print(f"目标时长: {TARGET_DURATION}s | 本次生成: {count} 条（起始 {start}） | 随机移调 ±{TRANSPOSE_RANGE} 半音")
 
-    for i in range(N_SAMPLES):
-        mid = pretty_midi.PrettyMIDI("original.mid")
+    used = Counter()
+    for i in range(start, start + count):
+        # 每个样本独立种子：保证分块运行也能得到确定、可复现的数据集
+        random.seed(42 + i)
 
-        # 1. 归一化 tempo（修复原始 MIDI 的异常长音）
+        # 0. 随机选一首曲目
+        src = random.choice(midi_files)
+        used[os.path.basename(src)] += 1
+        mid = pretty_midi.PrettyMIDI(src)
+
+        # 1. 归一化 tempo（统一到目标时长）
         normalize_tempo(mid)
 
-        # 2. 变速 0.9~1.1 倍
+        # 2. 随机整体移调（扩大音高覆盖范围）
+        transpose_midi(mid)
+
+        # 3. 变速 0.9~1.1 倍
         spd = random.uniform(0.9, 1.1)
         for inst in mid.instruments:
             for n in inst.notes:
                 n.start *= spd
                 n.end *= spd
 
-        # 3. 轻量数据增强（力度 + 时序抖动）
+        # 4. 轻量数据增强（力度 + 时序抖动）
         add_augmentation(mid)
 
-        # 4. 注入演奏错误
+        # 5. 注入演奏错误
         inject_errors(mid)
 
-        # 5. SoundFont 渲染音频
+        # 6. SoundFont 渲染音频
         audio = midi_to_audio(mid)
 
-        # 6. 提取 log-mel 频谱
+        # 7. 提取 log-mel 频谱
         mel = librosa.feature.melspectrogram(y=audio, sr=SR, n_mels=N_MELS, hop_length=HOP).T
         mel = librosa.power_to_db(mel)
         lab = midi_to_label(mid, mel.shape[0])
 
-        np.save(f"data/features/mel_{i}.npy", mel)
-        np.save(f"data/features/label_{i}.npy", lab)
+        np.save(os.path.join(DATA_DIR, f"mel_{i}.npy"), mel)
+        np.save(os.path.join(DATA_DIR, f"label_{i}.npy"), lab)
 
-        if (i + 1) % 100 == 0:
-            print(f"  已生成 {i + 1}/{N_SAMPLES}")
+        if (i + 1) % 100 == 0 or i == start + count - 1:
+            print(f"  已生成 {i + 1}/{start + count}")
 
-    # 可视化首个样本的频谱
-    mel0 = np.load("data/features/mel_0.npy")
+    # 可视化：优先用第 0 号样本，分块时用本块首样本
+    plot_id = 0 if os.path.exists(os.path.join(DATA_DIR, "mel_0.npy")) else start
+    mel0 = np.load(os.path.join(DATA_DIR, f"mel_{plot_id}.npy"))
     plt.figure(figsize=(10, 4))
     plt.imshow(mel0.T, aspect="auto", origin="lower", cmap="magma")
-    plt.title("Mel Spectrogram (SoundFont 渲染)")
+    plt.title("Mel Spectrogram (SoundFont Piano, multi-song corpus)")
     plt.colorbar()
     plt.ylabel("Mel bin")
     plt.xlabel("Frame")
     plt.tight_layout()
-    plt.savefig("mel_spectrogram.png", dpi=120)
+    plt.savefig(os.path.join(BASE_DIR, "mel_spectrogram.png"), dpi=120)
     plt.close()
-    print(f"✅ 基于 original.mid + SoundFont 渲染 + 错误注入，生成 {N_SAMPLES} 段训练数据")
+    print(f"✅ 本次生成 {count} 条，累计目标 {start + count} 条；曲目分布: "
+          + ", ".join(f"{k}×{v}" for k, v in used.most_common()))
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="多曲目钢琴训练数据生成")
+    parser.add_argument("--start", type=int, default=0, help="起始样本编号")
+    parser.add_argument("--count", type=int, default=N_SAMPLES, help="本次生成数量")
+    args = parser.parse_args()
+    main(args.start, args.count)
