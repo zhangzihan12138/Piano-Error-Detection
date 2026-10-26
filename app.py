@@ -16,7 +16,20 @@
 
 import os
 import subprocess
+import sys
 import tempfile
+
+# 无控制台启动（pythonw / 开机自启）时 stdout/stderr 为 None，
+# 任何 print 都会抛 AttributeError 导致进程闪退，这里先重定向到日志文件
+if sys.stdout is None or sys.stderr is None:
+    _run_log = open(
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "app_run.log"),
+        "a", encoding="utf-8", buffering=1,
+    )
+    if sys.stdout is None:
+        sys.stdout = _run_log
+    if sys.stderr is None:
+        sys.stderr = _run_log
 
 import gradio as gr
 import librosa
@@ -257,32 +270,43 @@ def analyze(audio_path, midi_path):
     if not midi_path:
         raise gr.Error("请先上传参考乐谱 MIDI 文件")
 
-    # 1. 提取频谱（MP4 等视频格式会先抽音轨） + 2. 模型预测 + 3. 转音符序列
-    mel, audio_dur = extract_mel(audio_path)
-    perf_notes = predict_notes(mel)
+    try:
+        # 1. 提取频谱（MP4 等视频格式会先抽音轨） + 2. 模型预测 + 3. 转音符序列
+        mel, audio_dur = extract_mel(audio_path)
+        perf_notes = predict_notes(mel)
 
-    # 4. 参考 MIDI 音符序列（按音频时长归一化 tempo，兼容异常 MIDI）
-    ref_notes = midi_to_notes(midi_path, audio_duration=audio_dur)
-    if not ref_notes:
-        raise gr.Error("参考 MIDI 中没有可用的钢琴音符（需 MIDI 21-108 范围）")
+        # 4. 参考 MIDI 音符序列（按音频时长归一化 tempo，兼容异常 MIDI）
+        ref_notes = midi_to_notes(midi_path, audio_duration=audio_dur)
+        if not ref_notes:
+            raise gr.Error("参考 MIDI 中没有可用的钢琴音符（需 MIDI 21-108 范围）")
 
-    # 5. DTW 对齐找错
-    from dtw_align import dtw_align
-    D, path, errors = dtw_align(ref_notes, perf_notes)
+        # 5. DTW 对齐找错
+        from dtw_align import dtw_align
+        D, path, errors = dtw_align(ref_notes, perf_notes)
 
-    summary = {
-        "num_ref_notes": len(ref_notes),
-        "num_detected_notes": len(perf_notes),
-        "num_wrong": sum(1 for e in errors if e["type"] == "wrong"),
-        "num_missed": sum(1 for e in errors if e["type"] == "missed"),
-        "num_extra": sum(1 for e in errors if e["type"] == "extra"),
-        "dtw_total_cost": round(float(D[-1, -1]), 3),
-        "errors": errors,
-    }
+        summary = {
+            "num_ref_notes": len(ref_notes),
+            "num_detected_notes": len(perf_notes),
+            "num_wrong": sum(1 for e in errors if e["type"] == "wrong"),
+            "num_missed": sum(1 for e in errors if e["type"] == "missed"),
+            "num_extra": sum(1 for e in errors if e["type"] == "extra"),
+            "dtw_total_cost": round(float(D[-1, -1]), 3),
+            "errors": errors,
+        }
 
-    # 6. 时间轴标红图
-    fig = plot_timeline(ref_notes, perf_notes, errors)
-    return summary, fig
+        # 6. 时间轴标红图
+        fig = plot_timeline(ref_notes, perf_notes, errors)
+        return summary, fig
+
+    except gr.Error:
+        # gr.Error 已经是友好的提示，直接向上抛出让 Gradio 处理
+        raise
+    except Exception as e:
+        # 捕获所有其他异常（音频解码失败、MIDI 解析错误等），
+        # 避免界面崩溃红字，改为弹出友好提示
+        print(f"[analyze] 处理失败: {type(e).__name__}: {e}")
+        gr.Warning("请上传正确的 WAV/MP3 音频和 MIDI 文件")
+        return {"error": "文件处理失败，请检查上传的音频和 MIDI 文件是否正确"}, None
 
 
 with gr.Blocks(title="钢琴错误检测系统") as demo:
@@ -316,4 +340,33 @@ with gr.Blocks(title="钢琴错误检测系统") as demo:
     btn.click(analyze, inputs=[audio_in, midi_in], outputs=[out_json, out_timeline])
 
 if __name__ == "__main__":
-    demo.launch(server_name="127.0.0.1", server_port=7860, inbrowser=False, share=True)
+    import socket
+
+    # ---- 启动前先清理残留（防止端口被旧实例占住）----
+    port = 7860
+    sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    port_free = sock.connect_ex(("127.0.0.1", port)) != 0
+    sock.close()
+    if not port_free:
+        print(f"⚠️ 端口 {port} 已被占用，先杀掉残留进程…", flush=True)
+        import subprocess
+        subprocess.run(["powershell", "-Command",
+            f"Get-NetTCPConnection -LocalPort {port} -ErrorAction SilentlyContinue | "
+            f"ForEach-Object {{ Stop-Process -Id $_.OwningProcess -Force -ErrorAction SilentlyContinue }}"],
+            capture_output=True)
+
+    # ---- share 模式：有网就穿透，没网就静默降级到本地 ----
+    share = True
+    try:
+        sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        sock.settimeout(2)
+        online = sock.connect_ex(("huggingface.co", 443)) == 0
+        sock.close()
+        if not online:
+            print("🌐 无法访问 huggingface.co，share 公网穿透跳过；局域网 IP 直连已就绪", flush=True)
+            share = False
+    except Exception:
+        share = False
+
+    # 绑定 0.0.0.0 = 监听所有网卡，同 WiFi 下其他设备可通过本机 IP 访问
+    demo.launch(server_name="0.0.0.0", server_port=port, inbrowser=False, share=share)
