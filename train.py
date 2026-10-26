@@ -46,10 +46,16 @@ def split_ids(n_total: int, seed: int = 42, train_ratio: float = 0.8) -> tuple[l
 
 
 def main() -> None:
+    # CPU 多线程加速（16 线程），显著缩短每轮耗时
+    torch.set_num_threads(16)
+
     # 0. 划分训练/测试集
     all_ids_dataset = PianoDataset(DATA_ROOT)
     train_ids, test_ids = split_ids(len(all_ids_dataset))
     dataset = PianoDataset(DATA_ROOT, ids=train_ids)
+    # 先落盘划分，保证中途中断时模型权重与测试集划分始终成对
+    with open(IDS_PATH, "w", encoding="utf-8") as f:
+        json.dump({"test_ids": test_ids, "train_ids": train_ids}, f)
 
     # 1. DataLoader（batch_size=8）
     loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=True)
@@ -81,7 +87,9 @@ def main() -> None:
         avg_loss = running_loss / max(seen, 1)
         epoch_losses.append(avg_loss)
         # 终端打印 Loss
-        print(f"Epoch {epoch:>2}/{EPOCHS}  Loss: {avg_loss:.6f}")
+        print(f"Epoch {epoch:>2}/{EPOCHS}  Loss: {avg_loss:.6f}", flush=True)
+        # 每轮落盘一次，机器意外关机时也能保留已完成轮次的权重
+        torch.save(model.state_dict(), MODEL_PATH)
 
     # 3. 绘制真实的 Loss 下降曲线
     plt.figure(figsize=(8, 5))
@@ -95,10 +103,8 @@ def main() -> None:
     plt.savefig(CURVE_PATH, dpi=150)
     print(f"Loss 曲线已保存: {CURVE_PATH}")
 
-    # 4. 保存模型权重与测试集划分，供 evaluate.py 使用
+    # 4. 保存模型权重（测试集划分已在训练开始时落盘），供 evaluate.py 使用
     torch.save(model.state_dict(), MODEL_PATH)
-    with open(IDS_PATH, "w", encoding="utf-8") as f:
-        json.dump({"test_ids": test_ids, "train_ids": train_ids}, f)
     print(f"模型权重已保存: {MODEL_PATH}")
     print(f"测试集划分已保存: {IDS_PATH}")
 
