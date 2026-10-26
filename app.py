@@ -265,10 +265,33 @@ def _pitch_by_name(name: str) -> int:
 
 def analyze(audio_path, midi_path):
     """主处理流程：抽取音轨（视频）→ 频谱 → 预测 → 音符 → DTW 找错 → JSON + 时间轴图。"""
+    # ── 输入校验：空值 ──
     if not audio_path:
         raise gr.Error("请先上传演奏录音或视频（WAV / MP3 / MP4）")
     if not midi_path:
         raise gr.Error("请先上传参考乐谱 MIDI 文件")
+
+    # ── 输入校验：文件扩展名 ──
+    audio_ext = os.path.splitext(audio_path)[1].lower()
+    if audio_ext not in SUPPORTED_EXTS:
+        raise gr.Error(
+            f"不支持的音频格式「{audio_ext}」。"
+            f"请上传 WAV / MP3 / FLAC / OGG / M4A 音频或 MP4 / MOV 等视频文件"
+        )
+    midi_ext = os.path.splitext(midi_path)[1].lower()
+    if midi_ext not in (".mid", ".midi"):
+        raise gr.Error(f"不支持的 MIDI 格式「{midi_ext}」，请上传 .mid 或 .midi 文件")
+
+    # ── 输入校验：MIDI 可解析性 ──
+    try:
+        _test_mid = pretty_midi.PrettyMIDI(midi_path)
+        _test_notes = sum(len(inst.notes) for inst in _test_mid.instruments)
+        if _test_notes == 0:
+            raise gr.Error("参考 MIDI 中没有任何音符，请确认文件是否正确")
+    except gr.Error:
+        raise
+    except Exception:
+        raise gr.Error("参考 MIDI 文件损坏或无法解析，请上传有效的 MIDI 文件")
 
     try:
         # 1. 提取频谱（MP4 等视频格式会先抽音轨） + 2. 模型预测 + 3. 转音符序列
@@ -280,9 +303,21 @@ def analyze(audio_path, midi_path):
         if not ref_notes:
             raise gr.Error("参考 MIDI 中没有可用的钢琴音符（需 MIDI 21-108 范围）")
 
-        # 5. DTW 对齐找错
-        from dtw_align import dtw_align
-        D, path, errors = dtw_align(ref_notes, perf_notes)
+        # 5. DTW 对齐找错；未检出音符时也返回漏音列表和时间轴，避免空序列导致页面报错
+        if perf_notes:
+            from dtw_align import dtw_align
+            D, _, errors = dtw_align(ref_notes, perf_notes)
+            total_cost = round(float(D[-1, -1]), 3)
+        else:
+            errors = [
+                {
+                    "type": "missed",
+                    "expected": midi_to_name(n["pitch"]),
+                    "ref_onset": round(n["start_time"], 3),
+                }
+                for n in ref_notes
+            ]
+            total_cost = None
 
         summary = {
             "num_ref_notes": len(ref_notes),
@@ -290,7 +325,7 @@ def analyze(audio_path, midi_path):
             "num_wrong": sum(1 for e in errors if e["type"] == "wrong"),
             "num_missed": sum(1 for e in errors if e["type"] == "missed"),
             "num_extra": sum(1 for e in errors if e["type"] == "extra"),
-            "dtw_total_cost": round(float(D[-1, -1]), 3),
+            "dtw_total_cost": total_cost,
             "errors": errors,
         }
 
